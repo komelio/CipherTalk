@@ -1,7 +1,7 @@
 import * as http from 'http'
-import { URL, fileURLToPath } from 'url'
+import { URL, fileURLToPath, pathToFileURL } from 'url'
 import { app } from 'electron'
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { join } from 'path'
 import { ConfigService } from './config'
@@ -37,6 +37,56 @@ interface HttpApiSettings {
   host: string
   port: number
   token: string
+}
+
+interface CleanedVideoMsg {
+  msgId: string
+  createTime: number
+  typeLabel: string
+  videoInfo: {
+    nickname: string
+    avatar: string
+    description: string
+    videoUrl: string
+    coverUrl: string
+    duration: number
+  }
+  rawType: number
+}
+
+type MessagePayload =
+  | { type: 'image'; url: string; thumb: string }
+  | {
+      type: 'location'
+      name: string
+      address: string
+      latitude: number | null
+      longitude: number | null
+      poiId: string
+    }
+  | { type: 'channels'; nickname: string; desc: string; videoUrl: string; cover: string }
+  | {
+      type: 'file'
+      fileName: string
+      fileSize: string
+      fileExt: string
+      attachId: string
+      localPath?: string
+      localFileUrl?: string
+      exists?: boolean
+    }
+  | { type: 'mini_program'; title: string; appId: string; path: string; icon: string }
+  | { type: 'bulk_forward'; title: string; items: Array<{ title: string; description: string; type: string }> }
+  | { type: 'app_link'; title: string; description: string; url: string }
+  | { type: 'unknown'; text: string }
+
+interface UnifiedMessage {
+  msgId: string
+  createTime: number
+  fromUser: string
+  msgType: number
+  appMsgType?: number
+  payload: MessagePayload
 }
 
 type ContactType = 'friend' | 'group' | 'official' | 'former_friend' | 'other'
@@ -315,6 +365,516 @@ class HttpApiService {
     return match?.[1]?.trim()
   }
 
+  private extractXmlTagValue(content: string, tagName: string): string | null {
+    if (!content || !tagName) return null
+    const escapedTag = tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(
+      `<${escapedTag}(?:\\s[^>]*)?>\\s*(?:<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>|([\\s\\S]*?))\\s*<\\/${escapedTag}>`,
+      'i'
+    )
+    const match = content.match(regex)
+    const value = (match?.[1] ?? match?.[2] ?? '').trim()
+    return value || null
+  }
+
+  private extractXmlBlock(content: string, tagName: string): string | null {
+    if (!content || !tagName) return null
+    const escapedTag = tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(`<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escapedTag}>`, 'i')
+    const match = content.match(regex)
+    const value = (match?.[1] || '').trim()
+    return value || null
+  }
+
+  private extractXmlAttribute(content: string, tagName: string, attrName: string): string | null {
+    if (!content || !tagName || !attrName) return null
+    const escapedTag = tagName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const escapedAttr = attrName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(
+      `<${escapedTag}(?:\\s[^>]*?)?\\b${escapedAttr}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`,
+      'i'
+    )
+    const match = content.match(regex)
+    const value = (match?.[1] ?? match?.[2] ?? '').trim()
+    return value || null
+  }
+
+  private parseJsonMaybe(value?: string | null): Record<string, any> | null {
+    if (!value) return null
+    try {
+      const parsed = JSON.parse(value)
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, any>
+      }
+      return null
+    } catch {
+      return null
+    }
+  }
+
+  private isGenericParsedContent(value?: string | null): boolean {
+    const text = String(value || '').trim()
+    if (!text) return true
+    return ['[消息]', '[应用消息]', '[未知消息]', '[app]'].includes(text.toLowerCase())
+  }
+
+  private pickFirstNonEmpty(...values: Array<string | null | undefined>): string | null {
+    for (const value of values) {
+      const text = String(value || '').trim()
+      if (text) return text
+    }
+    return null
+  }
+
+  private parseAppMessagePayload(rawContent?: string | null): { summary: string; details?: Record<string, any> } | null {
+    const raw = String(rawContent || '')
+    if (!raw || !/<appmsg[\s>]/i.test(raw)) return null
+
+    const appmsg = this.extractXmlBlock(raw, 'appmsg') || raw
+    const title = this.extractXmlTagValue(appmsg, 'title')
+    const description = this.extractXmlTagValue(appmsg, 'des')
+    const appMsgType = this.extractXmlTagValue(appmsg, 'type')
+    const action = this.extractXmlTagValue(appmsg, 'action')
+    const showType = this.extractXmlTagValue(appmsg, 'showtype')
+    const content = this.extractXmlTagValue(appmsg, 'content')
+    const url = this.extractXmlTagValue(appmsg, 'url')
+    const lowUrl = this.extractXmlTagValue(appmsg, 'lowurl')
+    const dataUrl = this.extractXmlTagValue(appmsg, 'dataurl')
+    const username = this.extractXmlTagValue(appmsg, 'username')
+    const thumbUrl = this.extractXmlTagValue(appmsg, 'thumburl')
+    const templateId = this.extractXmlTagValue(appmsg, 'template_id')
+    const recordItemRaw = this.extractXmlTagValue(appmsg, 'recorditem')
+
+    const webviewSharedBlock = this.extractXmlBlock(appmsg, 'webviewshared')
+    const webviewShared = webviewSharedBlock
+      ? {
+          shareUrlOriginal: this.extractXmlTagValue(webviewSharedBlock, 'shareUrlOriginal'),
+          shareUrlOpen: this.extractXmlTagValue(webviewSharedBlock, 'shareUrlOpen'),
+          jsAppId: this.extractXmlTagValue(webviewSharedBlock, 'jsAppId'),
+          publisherId: this.extractXmlTagValue(webviewSharedBlock, 'publisherId'),
+          publisherReqId: this.extractXmlTagValue(webviewSharedBlock, 'publisherReqId')
+        }
+      : null
+
+    const streamVideoBlock = this.extractXmlBlock(appmsg, 'streamvideo')
+    const streamVideo = streamVideoBlock
+      ? {
+          url: this.extractXmlTagValue(streamVideoBlock, 'streamvideourl'),
+          webUrl: this.extractXmlTagValue(streamVideoBlock, 'streamvideoweburl'),
+          title: this.extractXmlTagValue(streamVideoBlock, 'streamvideotitle'),
+          wording: this.extractXmlTagValue(streamVideoBlock, 'streamvideowording'),
+          thumbUrl: this.extractXmlTagValue(streamVideoBlock, 'streamvideothumburl'),
+          totalTime: this.extractXmlTagValue(streamVideoBlock, 'streamvideototaltime')
+        }
+      : null
+
+    const appAttachBlock = this.extractXmlBlock(appmsg, 'appattach')
+    const appAttach = appAttachBlock
+      ? {
+          fileName: this.extractXmlTagValue(appAttachBlock, 'filename'),
+          fileExt: this.extractXmlTagValue(appAttachBlock, 'fileext'),
+          totalLen: this.extractXmlTagValue(appAttachBlock, 'totallen'),
+          attachId: this.extractXmlTagValue(appAttachBlock, 'attachid'),
+          cdnAttachUrl: this.extractXmlTagValue(appAttachBlock, 'cdnattachurl')
+        }
+      : null
+
+    const weappInfoBlock = this.extractXmlBlock(appmsg, 'weappinfo')
+    const weappInfo = weappInfoBlock
+      ? {
+          username: this.extractXmlTagValue(weappInfoBlock, 'username'),
+          appid: this.extractXmlTagValue(weappInfoBlock, 'appid'),
+          appServiceType: this.extractXmlTagValue(weappInfoBlock, 'appservicetype'),
+          secFlagForSinglePageMode: this.extractXmlTagValue(weappInfoBlock, 'secflagforsinglepagemode'),
+          pagePath: this.pickFirstNonEmpty(
+            this.extractXmlTagValue(weappInfoBlock, 'pagepath'),
+            this.extractXmlTagValue(weappInfoBlock, 'path')
+          ),
+          query: this.extractXmlTagValue(weappInfoBlock, 'query')
+        }
+      : null
+
+    const finderFeedBlock = this.extractXmlBlock(appmsg, 'finderFeed')
+    let finderFeed: Record<string, any> | null = null
+    if (finderFeedBlock) {
+      const mediaListBlock = this.extractXmlBlock(finderFeedBlock, 'mediaList') || ''
+      const mediaBlocks = Array.from(mediaListBlock.matchAll(/<media(?:\s[^>]*)?>([\s\S]*?)<\/media>/gi))
+      const mediaItems = mediaBlocks
+        .map((m) => {
+          const block = (m[1] || '').trim()
+          if (!block) return null
+          return this.pruneEmpty({
+            mediaType: this.extractXmlTagValue(block, 'mediaType'),
+            url: this.extractXmlTagValue(block, 'url'),
+            thumbUrl: this.extractXmlTagValue(block, 'thumbUrl'),
+            coverUrl: this.extractXmlTagValue(block, 'coverUrl'),
+            fullCoverUrl: this.extractXmlTagValue(block, 'fullCoverUrl'),
+            width: this.extractXmlTagValue(block, 'width'),
+            height: this.extractXmlTagValue(block, 'height'),
+            videoPlayDuration: this.extractXmlTagValue(block, 'videoPlayDuration'),
+            videoDuration: this.extractXmlTagValue(block, 'videoDuration')
+          }) as Record<string, any> | undefined
+        })
+        .filter((item): item is Record<string, any> => Boolean(item))
+
+      finderFeed = {
+        objectId: this.extractXmlTagValue(finderFeedBlock, 'objectId'),
+        objectNonceId: this.extractXmlTagValue(finderFeedBlock, 'objectNonceId'),
+        feedType: this.extractXmlTagValue(finderFeedBlock, 'feedType'),
+        nickname: this.extractXmlTagValue(finderFeedBlock, 'nickname'),
+        username: this.extractXmlTagValue(finderFeedBlock, 'username'),
+        avatar: this.extractXmlTagValue(finderFeedBlock, 'avatar'),
+        desc: this.extractXmlTagValue(finderFeedBlock, 'desc'),
+        mediaCount: this.extractXmlTagValue(finderFeedBlock, 'mediaCount'),
+        authIconType: this.extractXmlTagValue(finderFeedBlock, 'authIconType'),
+        authIconUrl: this.extractXmlTagValue(finderFeedBlock, 'authIconUrl'),
+        finderShareExtInfo: this.parseJsonMaybe(this.extractXmlTagValue(finderFeedBlock, 'finderShareExtInfo')),
+        media: mediaItems.length > 0 ? mediaItems : null
+      }
+    }
+
+    const referMsgBlock = this.extractXmlBlock(appmsg, 'refermsg')
+    const referMsg = referMsgBlock
+      ? {
+          type: this.extractXmlTagValue(referMsgBlock, 'type'),
+          svrid: this.extractXmlTagValue(referMsgBlock, 'svrid'),
+          fromusr: this.extractXmlTagValue(referMsgBlock, 'fromusr'),
+          chatusr: this.extractXmlTagValue(referMsgBlock, 'chatusr'),
+          displayname: this.extractXmlTagValue(referMsgBlock, 'displayname'),
+          title: this.extractXmlTagValue(referMsgBlock, 'title'),
+          content: this.extractXmlTagValue(referMsgBlock, 'content'),
+          url: this.extractXmlTagValue(referMsgBlock, 'url')
+        }
+      : null
+
+    const firstFinderMedia = finderFeed?.media?.[0] || null
+    const finderMediaUrl = this.pickFirstNonEmpty(
+      firstFinderMedia?.url,
+      firstFinderMedia?.coverUrl,
+      firstFinderMedia?.thumbUrl
+    )
+    const targetUrl = this.pickFirstNonEmpty(
+      url,
+      webviewShared?.shareUrlOpen,
+      webviewShared?.shareUrlOriginal,
+      streamVideo?.webUrl,
+      streamVideo?.url,
+      finderMediaUrl,
+      referMsg?.url
+    )
+    const previewImageUrl = this.pickFirstNonEmpty(
+      thumbUrl,
+      firstFinderMedia?.thumbUrl,
+      firstFinderMedia?.coverUrl,
+      firstFinderMedia?.fullCoverUrl,
+      streamVideo?.thumbUrl,
+      finderFeed?.avatar
+    )
+    const cardTitle = this.pickFirstNonEmpty(title, finderFeed?.nickname, streamVideo?.title, appAttach?.fileName)
+    const cardDesc = this.pickFirstNonEmpty(description, finderFeed?.desc, streamVideo?.wording, content)
+    const isMiniProgram = appMsgType === '33' || appMsgType === '36' || Boolean(weappInfo?.appid || weappInfo?.username)
+    const cardType = isMiniProgram
+      ? 'mini_program'
+      : appAttach?.fileName
+        ? 'file'
+        : (firstFinderMedia?.mediaType === '4' || finderMediaUrl || streamVideo?.url || streamVideo?.webUrl)
+          ? 'video'
+          : 'link'
+    const card = this.pruneEmpty({
+      cardType,
+      clickable: Boolean(targetUrl),
+      title: cardTitle,
+      description: cardDesc,
+      targetUrl,
+      previewImageUrl,
+      appMsgType,
+      action,
+      showType
+    })
+
+    const details = this.pruneEmpty({
+      appMsgType,
+      title,
+      description,
+      action,
+      showType,
+      content,
+      username,
+      url,
+      lowUrl,
+      dataUrl,
+      thumbUrl,
+      templateId,
+      recordItemRaw,
+      webviewShared,
+      streamVideo,
+      appAttach,
+      weappInfo,
+      finderFeed,
+      referMsg,
+      card
+    }) as Record<string, any> | undefined
+
+    const videoUrl = this.pickFirstNonEmpty(firstFinderMedia?.url, streamVideo?.url, streamVideo?.webUrl)
+    const linkUrl = this.pickFirstNonEmpty(url, lowUrl, dataUrl, webviewShared?.shareUrlOpen, webviewShared?.shareUrlOriginal)
+    const fileName = appAttach?.fileName || null
+    const miniProgramName = this.pickFirstNonEmpty(cardTitle, weappInfo?.username, weappInfo?.appid, username)
+    const mainText = this.pickFirstNonEmpty(cardTitle, cardDesc, content)
+    let summary = '[应用消息]'
+
+    if (isMiniProgram) {
+      summary = `[小程序] ${miniProgramName || '小程序'}${targetUrl ? ` ${targetUrl}` : ''}`.trim()
+    } else if (videoUrl) {
+      const sourceName = this.pickFirstNonEmpty(finderFeed?.nickname, mainText, '视频')
+      summary = `[视频] ${sourceName}${targetUrl ? ` ${targetUrl}` : ''}`.trim()
+    } else if (fileName) {
+      summary = `[文件] ${fileName}`
+    } else if (targetUrl || linkUrl) {
+      const finalUrl = targetUrl || linkUrl
+      const linkText = this.pickFirstNonEmpty(mainText, finalUrl)
+      summary = `[链接] ${linkText}${finalUrl ? ` ${finalUrl}` : ''}`.trim()
+    } else if (mainText) {
+      summary = `[应用消息] ${mainText}`
+    }
+
+    return { summary, details }
+  }
+
+  private parseNumberLike(value: unknown): number {
+    const text = String(value ?? '').trim()
+    if (!text) return 0
+    const n = Number(text)
+    if (!Number.isFinite(n)) return 0
+    return n
+  }
+
+  private cleanAccountDirName(dirName: string): string {
+    const trimmed = String(dirName || '').trim()
+    if (!trimmed) return ''
+    if (trimmed.toLowerCase().startsWith('wxid_')) {
+      const match = trimmed.match(/^(wxid_[a-zA-Z0-9]+)/i)
+      if (match?.[1]) return match[1]
+      return trimmed
+    }
+    const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+    if (suffixMatch?.[1]) return suffixMatch[1]
+    return trimmed
+  }
+
+  private buildAccountDirCandidates(baseDir: string, myWxid: string): string[] {
+    const candidates: string[] = []
+    const push = (value?: string) => {
+      const text = String(value || '').trim()
+      if (!text || candidates.includes(text)) return
+      candidates.push(text)
+    }
+
+    const rawWxid = String(myWxid || '').trim()
+    const cleanedWxid = this.cleanAccountDirName(rawWxid)
+    push(rawWxid)
+    push(cleanedWxid)
+
+    try {
+      const entries = readdirSync(baseDir, { withFileTypes: true })
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const dirName = entry.name
+        const cleanedDirName = this.cleanAccountDirName(dirName)
+        if (
+          dirName === rawWxid ||
+          dirName === cleanedWxid ||
+          dirName.startsWith(`${rawWxid}_`) ||
+          dirName.startsWith(`${cleanedWxid}_`) ||
+          cleanedDirName === rawWxid ||
+          cleanedDirName === cleanedWxid
+        ) {
+          push(dirName)
+        }
+      }
+    } catch {}
+
+    return candidates
+  }
+
+  private buildFileMonthCandidates(createTimeMs: number): string[] {
+    const folders: string[] = []
+    const push = (date: Date) => {
+      const year = date.getFullYear()
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const key = `${year}-${month}`
+      if (!folders.includes(key)) folders.push(key)
+    }
+    const baseDate = createTimeMs ? new Date(createTimeMs) : new Date()
+    push(baseDate)
+    const prev = new Date(baseDate)
+    prev.setMonth(prev.getMonth() - 1)
+    push(prev)
+    const next = new Date(baseDate)
+    next.setMonth(next.getMonth() + 1)
+    push(next)
+    return folders
+  }
+
+  private buildCleanedVideoMsg(
+    base: Record<string, any>,
+    kind: { typeLabel: string; appMsgType?: string },
+    appDetails?: Record<string, any>
+  ): CleanedVideoMsg | null {
+    const rawType = Number(kind.appMsgType || appDetails?.appMsgType || 0)
+    if (rawType !== 51) return null
+
+    const finderFeed = (appDetails?.finderFeed || {}) as Record<string, any>
+    const mediaCandidate = Array.isArray(finderFeed.media) ? finderFeed.media[0] : finderFeed.media
+    const media = (mediaCandidate || {}) as Record<string, any>
+    const duration = this.parseNumberLike(media.videoDuration ?? media.videoPlayDuration)
+
+    return {
+      msgId: String(base.serverId || base.localId || ''),
+      createTime: Number(base.createTime || 0),
+      typeLabel: kind.typeLabel || '应用消息',
+      rawType,
+      videoInfo: {
+        nickname: String(finderFeed.nickname || ''),
+        avatar: String(finderFeed.avatar || ''),
+        description: String(finderFeed.desc || ''),
+        videoUrl: String(media.url || ''),
+        coverUrl: String(media.thumbUrl || media.coverUrl || ''),
+        duration
+      }
+    }
+  }
+
+  private decodeXmlEntities(value?: string | null): string {
+    const text = String(value || '')
+    if (!text) return ''
+    return text
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&')
+  }
+
+  private buildBulkForwardPayload(recordItemRaw?: string | null): { title: string; items: Array<{ title: string; description: string; type: string }> } {
+    const decoded = this.decodeXmlEntities(recordItemRaw)
+    const title =
+      this.extractXmlTagValue(decoded, 'title') ||
+      this.extractXmlTagValue(decoded, 'sourcename') ||
+      this.extractXmlTagValue(decoded, 'chatname') ||
+      ''
+
+    const itemBlocks = Array.from(decoded.matchAll(/<dataitem(?:\s[^>]*)?>([\s\S]*?)<\/dataitem>/gi))
+    const items = itemBlocks
+      .map((m) => {
+        const block = (m[1] || '').trim()
+        if (!block) return null
+        return {
+          title: this.extractXmlTagValue(block, 'sourcetitle') || this.extractXmlTagValue(block, 'title') || '',
+          description: this.extractXmlTagValue(block, 'datadesc') || this.extractXmlTagValue(block, 'digest') || '',
+          type: this.extractXmlTagValue(block, 'datatype') || this.extractXmlTagValue(block, 'type') || ''
+        }
+      })
+      .filter((x): x is { title: string; description: string; type: string } => Boolean(x))
+
+    return { title, items }
+  }
+
+  private buildUnifiedMessage(
+    base: Record<string, any>,
+    kind: { messageKind: string; typeLabel: string; appMsgType?: string },
+    appDetails?: Record<string, any>
+  ): UnifiedMessage {
+    const appMsgTypeNum = Number(kind.appMsgType || appDetails?.appMsgType || 0)
+    const rawContent = String(base.rawContent || '')
+    const finderFeed = (appDetails?.finderFeed || {}) as Record<string, any>
+    const finderMediaCandidate = Array.isArray(finderFeed.media) ? finderFeed.media[0] : finderFeed.media
+    const finderMedia = (finderMediaCandidate || {}) as Record<string, any>
+    const appAttach = (appDetails?.appAttach || {}) as Record<string, any>
+    const weappInfo = (appDetails?.weappInfo || {}) as Record<string, any>
+    const webviewShared = (appDetails?.webviewShared || {}) as Record<string, any>
+
+    let payload: MessagePayload
+    if (Number(base.localType || 0) === 3) {
+      payload = {
+        type: 'image',
+        url: String(base.imageUrl || base.cdnImageUrl || ''),
+        thumb: String(base.thumbUrl || '')
+      }
+    } else if (Number(base.localType || 0) === 48) {
+      const label = this.extractXmlAttribute(rawContent, 'location', 'label')
+      const poiname = this.extractXmlAttribute(rawContent, 'location', 'poiname')
+      const x = this.extractXmlAttribute(rawContent, 'location', 'x')
+      const y = this.extractXmlAttribute(rawContent, 'location', 'y')
+      const poiId = this.extractXmlAttribute(rawContent, 'location', 'poiid')
+      const parsedText = String(base.parsedContent || '').replace(/^\[位置\]\s*/u, '').trim()
+      const latitudeRaw = this.parseNumberLike(x)
+      const longitudeRaw = this.parseNumberLike(y)
+      payload = {
+        type: 'location',
+        name: String(poiname || label || parsedText || ''),
+        address: String(label || poiname || parsedText || ''),
+        latitude: Number.isFinite(latitudeRaw) && latitudeRaw !== 0 ? latitudeRaw : null,
+        longitude: Number.isFinite(longitudeRaw) && longitudeRaw !== 0 ? longitudeRaw : null,
+        poiId: String(poiId || '')
+      }
+    } else if (appMsgTypeNum === 51) {
+      payload = {
+        type: 'channels',
+        nickname: String(finderFeed.nickname || ''),
+        desc: String(finderFeed.desc || ''),
+        videoUrl: String(finderMedia.url || ''),
+        cover: String(finderMedia.thumbUrl || finderMedia.coverUrl || '')
+      }
+    } else if (appMsgTypeNum === 6) {
+      payload = {
+        type: 'file',
+        fileName: String(appAttach.fileName || appDetails?.title || base.fileName || ''),
+        fileSize: String(appAttach.totalLen || base.fileSize || ''),
+        fileExt: String(appAttach.fileExt || base.fileExt || ''),
+        attachId: String(appAttach.attachId || ''),
+        localPath: '',
+        localFileUrl: '',
+        exists: false
+      }
+    } else if (appMsgTypeNum === 33 || appMsgTypeNum === 36) {
+      payload = {
+        type: 'mini_program',
+        title: String(appDetails?.title || ''),
+        appId: String(weappInfo.appid || weappInfo.username || ''),
+        path: String(weappInfo.pagePath || weappInfo.query || ''),
+        icon: String(appDetails?.thumbUrl || appAttach.cdnAttachUrl || '')
+      }
+    } else if (appMsgTypeNum === 19) {
+      const bulk = this.buildBulkForwardPayload(appDetails?.recordItemRaw || '')
+      payload = {
+        type: 'bulk_forward',
+        title: bulk.title,
+        items: bulk.items
+      }
+    } else if (appMsgTypeNum === 5 || appMsgTypeNum === 49) {
+      payload = {
+        type: 'app_link',
+        title: String(appDetails?.title || ''),
+        description: String(appDetails?.description || ''),
+        url: String(appDetails?.url || webviewShared.shareUrlOpen || webviewShared.shareUrlOriginal || '')
+      }
+    } else {
+      payload = {
+        type: 'unknown',
+        text: String(base.parsedContent || '')
+      }
+    }
+
+    return {
+      msgId: String(base.serverId || base.localId || ''),
+      createTime: Number(base.createTime || 0),
+      fromUser: String(base.senderUsername || ''),
+      msgType: Number(base.localType || 0),
+      appMsgType: appMsgTypeNum || undefined,
+      payload
+    }
+  }
+
   private fileUrlToPathMaybe(input?: string | null): string | null {
     if (!input) return null
     if (input.startsWith('file:///')) {
@@ -437,7 +997,7 @@ class HttpApiService {
 
   private detectSessionType(username: string): SessionTypeFilter {
     if (username.includes('@chatroom')) return 'group'
-    if (username.startsWith('gh_')) return 'official'
+    if (username.startsWith('gh_') || username.includes('@openim') || username.startsWith('service_')) return 'official'
     if (username) return 'friend'
     return 'other'
   }
@@ -756,17 +1316,41 @@ class HttpApiService {
       const shouldResolveMediaPath = includeField('media') && resolveMediaPath
       const shouldResolveVoicePath = includeField('media') && resolveVoicePath
       const includeChatRecordItems = includeField('chatrecord')
+      const shouldIncludeSenderProfile = includeField('base') || includeField('sender')
 
       let myWxid = ''
       let dbPath = ''
       let cachePath = ''
-      if (shouldResolveVoicePath || shouldResolveMediaPath || includeField('file')) {
+      if (shouldResolveVoicePath || shouldResolveMediaPath || includeField('file') || shouldIncludeSenderProfile) {
         const runtimeConfig = new ConfigService()
         myWxid = String(runtimeConfig.get('myWxid') || '')
         dbPath = String(runtimeConfig.get('dbPath') || '')
         cachePath = String(runtimeConfig.get('cachePath') || '')
         runtimeConfig.close()
       }
+
+      const senderProfileMap = new Map<string, { displayName: string; avatarUrl?: string; remark?: string; nickname?: string }>()
+      if (shouldIncludeSenderProfile) {
+        try {
+          const contactsResult = await chatService.getContacts()
+          if (contactsResult.success && Array.isArray(contactsResult.contacts)) {
+            for (const contact of contactsResult.contacts) {
+              const username = String(contact.username || '').trim()
+              if (!username) continue
+              senderProfileMap.set(username, {
+                displayName: String(contact.displayName || username),
+                avatarUrl: contact.avatarUrl || undefined,
+                remark: contact.remark || undefined,
+                nickname: contact.nickname || undefined
+              })
+            }
+          }
+        } catch {
+          // ignore sender profile preload errors for API stability
+        }
+      }
+
+      const accountDirCandidates = dbPath && myWxid ? this.buildAccountDirCandidates(dbPath, myWxid) : []
 
       const fetchBatchSize = 200
       const targetCount = offset + limit
@@ -844,7 +1428,23 @@ class HttpApiService {
         const base = m as Record<string, any>
         const kind = needKindForOutput ? this.detectMessageKind(base) : { messageKind: 'unknown', typeLabel: '未知类型', appMsgType: undefined }
         const createTimeMs = this.normalizeTimestampMs(Number(base.createTime || 0))
-        const senderUsername = base.senderUsername || null
+        const isSelf = Number(base.isSend) === 1
+        const senderUsername =
+          String(base.senderUsername || '').trim() || (isSelf && myWxid ? String(myWxid) : '') || null
+        const senderProfile = senderUsername ? senderProfileMap.get(senderUsername) : undefined
+        const senderDisplayName = senderProfile?.displayName || senderUsername
+        const senderAvatarUrl = senderProfile?.avatarUrl || null
+        const appParsed =
+          kind.messageKind === 'app' || kind.messageKind.startsWith('app_')
+            ? this.parseAppMessagePayload(base.rawContent || '')
+            : null
+        const parsedContent = (() => {
+          const current = String(base.parsedContent || '').trim()
+          if (appParsed && this.isGenericParsedContent(current)) {
+            return appParsed.summary
+          }
+          return current || appParsed?.summary || ''
+        })()
 
         const metadata = {
           localType: Number(base.localType || 0),
@@ -860,8 +1460,14 @@ class HttpApiService {
           hasFile: Boolean(base.fileName || base.fileMd5),
           hasTransfer: Boolean(base.transferPayerUsername || base.transferReceiverUsername),
           hasChatRecord: Array.isArray(base.chatRecordList) && base.chatRecordList.length > 0,
-          isLivePhoto: Boolean(base.isLivePhoto)
+          isLivePhoto: Boolean(base.isLivePhoto),
+          hasAppPayload: Boolean(appParsed?.details),
+          hasClickableCard: Boolean((appParsed?.details as any)?.card?.clickable)
         }
+
+        const appCard = (appParsed?.details as any)?.card as Record<string, any> | undefined
+        const cleanedVideoMsg = this.buildCleanedVideoMsg(base, kind, appParsed?.details)
+        let unifiedMessage = this.buildUnifiedMessage(base, kind, appParsed?.details)
 
         const media = {
           imageMd5: base.imageMd5 || null,
@@ -874,7 +1480,11 @@ class HttpApiService {
           videoDuration: base.videoDuration || null,
           videoCachePath: null as string | null,
           voiceDuration: base.voiceDuration || null,
-          voiceCachePath: null as string | null
+          voiceCachePath: null as string | null,
+          appCardTitle: appCard?.title || null,
+          appCardDescription: appCard?.description || null,
+          appTargetUrl: appCard?.targetUrl || null,
+          appPreviewImageUrl: appCard?.previewImageUrl || null
         }
 
         if (shouldResolveMediaPath && (kind.messageKind === 'emoji' || kind.messageKind.startsWith('app_')) && (base.emojiMd5 || base.emojiCdnUrl)) {
@@ -976,17 +1586,52 @@ class HttpApiService {
             }
           : null
 
-        if (shouldResolveMediaPath && file?.name && dbPath && myWxid) {
+        if ((shouldResolveMediaPath || includeField('file')) && file?.name && dbPath && myWxid) {
           try {
-            const msgDate = createTimeMs ? new Date(createTimeMs) : new Date()
-            const year = msgDate.getFullYear()
-            const month = String(msgDate.getMonth() + 1).padStart(2, '0')
-            const dateFolder = `${year}-${month}`
-            const abs = join(dbPath, myWxid, 'msg', 'file', dateFolder, String(file.name))
-            file.absolutePath = abs
-            file.exists = existsSync(abs)
+            const monthFolders = this.buildFileMonthCandidates(createTimeMs)
+            const fileName = String(file.name)
+            let resolvedPath = ''
+            for (const accountDir of accountDirCandidates) {
+              for (const monthFolder of monthFolders) {
+                const candidate = join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
+                if (existsSync(candidate)) {
+                  resolvedPath = candidate
+                  break
+                }
+              }
+              if (resolvedPath) break
+            }
+            if (!resolvedPath) {
+              const accountDir = accountDirCandidates[0] || myWxid
+              const monthFolder = monthFolders[0] || ''
+              resolvedPath = join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
+            }
+            file.absolutePath = resolvedPath
+            file.exists = existsSync(resolvedPath)
           } catch {
             // ignore file path resolve errors
+          }
+        }
+
+        if (unifiedMessage.payload.type === 'file') {
+          const localPath = file?.absolutePath || ''
+          const localFileUrl = localPath
+            ? (() => {
+                try {
+                  return pathToFileURL(localPath).toString()
+                } catch {
+                  return ''
+                }
+              })()
+            : ''
+          unifiedMessage = {
+            ...unifiedMessage,
+            payload: {
+              ...unifiedMessage.payload,
+              localPath,
+              localFileUrl,
+              exists: Boolean(file?.exists)
+            }
           }
         }
 
@@ -1013,8 +1658,7 @@ class HttpApiService {
           out.createTime = Number(base.createTime || 0)
           out.sortSeq = Number(base.sortSeq || 0)
           out.isSend = base.isSend ?? null
-          out.senderUsername = senderUsername
-          out.parsedContent = base.parsedContent || ''
+          out.parsedContent = parsedContent
         }
 
         if (includeField('raw')) {
@@ -1036,13 +1680,27 @@ class HttpApiService {
         if (includeField('sender')) {
           out.sender = {
             username: senderUsername,
-            isSelf: Number(base.isSend) === 1
+            isSelf,
+            displayName: senderDisplayName,
+            avatarUrl: senderAvatarUrl,
+            remark: senderProfile?.remark || null,
+            nickname: senderProfile?.nickname || null
           }
         }
 
         if (includeField('metadata')) {
           out.metadata = metadata
         }
+
+        if (appParsed?.details && (includeField('metadata') || includeField('media'))) {
+          out.app = appParsed.details
+        }
+
+        if (cleanedVideoMsg) {
+          out.cleanedVideoMsg = cleanedVideoMsg
+        }
+
+        out.unifiedMessage = unifiedMessage
 
         if (includeField('media')) {
           out.media = media

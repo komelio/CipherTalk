@@ -65,6 +65,8 @@ export interface Message {
   fileSize?: number       // 文件大小（字节）
   fileExt?: string        // 文件扩展名
   fileMd5?: string        // 文件 MD5
+  fileLocalPath?: string  // 文件本地绝对路径
+  fileExists?: boolean    // 文件是否存在
   chatRecordList?: ChatRecordItem[] // 聊天记录列表 (Type 19)
   // 转账消息相关
   transferPayerUsername?: string    // 转账付款方 wxid
@@ -1222,12 +1224,16 @@ class ChatService extends EventEmitter {
             let fileSize: number | undefined
             let fileExt: string | undefined
             let fileMd5: string | undefined
+            let fileLocalPath: string | undefined
+            let fileExists: boolean | undefined
             if (localType === 49 && content) {
-              const fileInfo = this.parseFileInfo(content)
+              const fileInfo = this.parseFileInfo(content, row.create_time || 0)
               fileName = fileInfo.fileName
               fileSize = fileInfo.fileSize
               fileExt = fileInfo.fileExt
               fileMd5 = fileInfo.fileMd5
+              fileLocalPath = fileInfo.fileLocalPath
+              fileExists = fileInfo.fileExists
             }
 
             // 解析聊天记录 (localType === 49 且 XML 中 type=19，或者直接检查 XML type=19)
@@ -1281,6 +1287,8 @@ class ChatService extends EventEmitter {
               fileSize,
               fileExt,
               fileMd5,
+              fileLocalPath,
+              fileExists,
               chatRecordList,
               transferPayerUsername,
               transferReceiverUsername
@@ -1517,12 +1525,16 @@ class ChatService extends EventEmitter {
             let fileSize: number | undefined
             let fileExt: string | undefined
             let fileMd5: string | undefined
+            let fileLocalPath: string | undefined
+            let fileExists: boolean | undefined
             if (localType === 49 && content) {
-              const fileInfo = this.parseFileInfo(content)
+              const fileInfo = this.parseFileInfo(content, row.create_time || 0)
               fileName = fileInfo.fileName
               fileSize = fileInfo.fileSize
               fileExt = fileInfo.fileExt
               fileMd5 = fileInfo.fileMd5
+              fileLocalPath = fileInfo.fileLocalPath
+              fileExists = fileInfo.fileExists
             }
 
             let chatRecordList: ChatRecordItem[] | undefined
@@ -1573,6 +1585,8 @@ class ChatService extends EventEmitter {
               fileSize,
               fileExt,
               fileMd5,
+              fileLocalPath,
+              fileExists,
               chatRecordList,
               transferPayerUsername,
               transferReceiverUsername
@@ -1789,12 +1803,16 @@ class ChatService extends EventEmitter {
             let fileSize: number | undefined
             let fileExt: string | undefined
             let fileMd5: string | undefined
+            let fileLocalPath: string | undefined
+            let fileExists: boolean | undefined
             if (localType === 49 && content) {
-              const fileInfo = this.parseFileInfo(content)
+              const fileInfo = this.parseFileInfo(content, row.create_time || 0)
               fileName = fileInfo.fileName
               fileSize = fileInfo.fileSize
               fileExt = fileInfo.fileExt
               fileMd5 = fileInfo.fileMd5
+              fileLocalPath = fileInfo.fileLocalPath
+              fileExists = fileInfo.fileExists
             }
 
             let chatRecordList: ChatRecordItem[] | undefined
@@ -1845,6 +1863,8 @@ class ChatService extends EventEmitter {
               fileSize,
               fileExt,
               fileMd5,
+              fileLocalPath,
+              fileExists,
               chatRecordList,
               transferPayerUsername,
               transferReceiverUsername
@@ -2259,12 +2279,16 @@ class ChatService extends EventEmitter {
             let fileSize: number | undefined
             let fileExt: string | undefined
             let fileMd5: string | undefined
+            let fileLocalPath: string | undefined
+            let fileExists: boolean | undefined
             if (localType === 49 && content) {
-              const fileInfo = this.parseFileInfo(content)
+              const fileInfo = this.parseFileInfo(content, row.create_time || 0)
               fileName = fileInfo.fileName
               fileSize = fileInfo.fileSize
               fileExt = fileInfo.fileExt
               fileMd5 = fileInfo.fileMd5
+              fileLocalPath = fileInfo.fileLocalPath
+              fileExists = fileInfo.fileExists
             }
 
             // 解析聊天记录 (检查 XML type=19)
@@ -2317,6 +2341,8 @@ class ChatService extends EventEmitter {
               fileSize,
               fileExt,
               fileMd5,
+              fileLocalPath,
+              fileExists,
               chatRecordList,
               transferPayerUsername,
               transferReceiverUsername
@@ -2737,7 +2763,10 @@ class ChatService extends EventEmitter {
    * 解析文件消息信息
    * 从 type=6 的文件消息 XML 中提取文件信息
    */
-  private parseFileInfo(content: string): { fileName?: string; fileSize?: number; fileExt?: string; fileMd5?: string } {
+  private parseFileInfo(
+    content: string,
+    createTime?: number
+  ): { fileName?: string; fileSize?: number; fileExt?: string; fileMd5?: string; fileLocalPath?: string; fileExists?: boolean } {
     if (!content) return {}
 
     try {
@@ -2758,10 +2787,51 @@ class ChatService extends EventEmitter {
       // 提取文件 MD5
       const fileMd5 = this.extractXmlValue(content, 'md5')?.toLowerCase()
 
-      return { fileName, fileSize, fileExt, fileMd5 }
+      const localFile = fileName ? this.resolveFileLocalPath(fileName, createTime || 0) : undefined
+
+      return {
+        fileName,
+        fileSize,
+        fileExt,
+        fileMd5,
+        fileLocalPath: localFile?.fileLocalPath,
+        fileExists: localFile?.fileExists
+      }
     } catch {
       return {}
     }
+  }
+
+  private resolveFileLocalPath(fileName: string, createTime: number): { fileLocalPath?: string; fileExists?: boolean } {
+    const dbPath = String(this.configService.get('dbPath') || '').trim()
+    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    if (!dbPath || !myWxid || !fileName) return {}
+
+    const accountDir = this.findAccountDir(dbPath, myWxid) || myWxid
+    const msgDate = createTime ? new Date(createTime * 1000) : new Date()
+    const monthCandidates: string[] = []
+    const pushMonth = (date: Date) => {
+      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+      if (!monthCandidates.includes(key)) monthCandidates.push(key)
+    }
+    pushMonth(msgDate)
+    const prevMonth = new Date(msgDate)
+    prevMonth.setMonth(prevMonth.getMonth() - 1)
+    pushMonth(prevMonth)
+    const nextMonth = new Date(msgDate)
+    nextMonth.setMonth(nextMonth.getMonth() + 1)
+    pushMonth(nextMonth)
+
+    for (const monthFolder of monthCandidates) {
+      const candidate = path.join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
+      if (fs.existsSync(candidate)) {
+        return { fileLocalPath: candidate, fileExists: true }
+      }
+    }
+
+    const fallbackMonth = monthCandidates[0] || `${msgDate.getFullYear()}-${String(msgDate.getMonth() + 1).padStart(2, '0')}`
+    const fallbackPath = path.join(dbPath, accountDir, 'msg', 'file', fallbackMonth, fileName)
+    return { fileLocalPath: fallbackPath, fileExists: fs.existsSync(fallbackPath) }
   }
 
   /**
@@ -3233,9 +3303,6 @@ class ChatService extends EventEmitter {
     for (const prefix of excludeList) {
       if (username.startsWith(prefix) || username === prefix) return false
     }
-
-    if (username.includes('@kefu.openim') || username.includes('@openim')) return false
-    if (username.includes('service_')) return false
 
     return true
   }
@@ -5298,6 +5365,8 @@ class ChatService extends EventEmitter {
           let fileSize: number | undefined
           let fileExt: string | undefined
           let fileMd5: string | undefined
+          let fileLocalPath: string | undefined
+          let fileExists: boolean | undefined
 
           if (localType === 47 && content) {
             const emojiInfo = this.parseEmojiInfo(content)
@@ -5316,11 +5385,13 @@ class ChatService extends EventEmitter {
             voiceDuration = this.parseVoiceDuration(content)
           } else if (localType === 49 && content) {
             // 解析文件消息
-            const fileInfo = this.parseFileInfo(content)
+            const fileInfo = this.parseFileInfo(content, row.create_time || 0)
             fileName = fileInfo.fileName
             fileSize = fileInfo.fileSize
             fileExt = fileInfo.fileExt
             fileMd5 = fileInfo.fileMd5
+            fileLocalPath = fileInfo.fileLocalPath
+            fileExists = fileInfo.fileExists
           }
 
           let chatRecordList: ChatRecordItem[] | undefined
@@ -5375,6 +5446,8 @@ class ChatService extends EventEmitter {
             fileSize,
             fileExt,
             fileMd5,
+            fileLocalPath,
+            fileExists,
             chatRecordList,
             transferPayerUsername,
             transferReceiverUsername
