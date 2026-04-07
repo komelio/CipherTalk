@@ -71,6 +71,8 @@ type MessagePayload =
       fileSize: string
       fileExt: string
       attachId: string
+      fileLocalPath?: string
+      fileLocalUrl?: string
       localPath?: string
       localFileUrl?: string
       exists?: boolean
@@ -712,6 +714,8 @@ class HttpApiService {
     const next = new Date(baseDate)
     next.setMonth(next.getMonth() + 1)
     push(next)
+    // 下载时间可能是当前月份
+    push(new Date())
     return folders
   }
 
@@ -832,6 +836,8 @@ class HttpApiService {
         fileSize: String(appAttach.totalLen || base.fileSize || ''),
         fileExt: String(appAttach.fileExt || base.fileExt || ''),
         attachId: String(appAttach.attachId || ''),
+        fileLocalPath: '',
+        fileLocalUrl: '',
         localPath: '',
         localFileUrl: '',
         exists: false
@@ -1581,6 +1587,8 @@ class HttpApiService {
               size: base.fileSize || null,
               ext: base.fileExt || null,
               md5: base.fileMd5 || null,
+              fileLocalPath: null as string | null,
+              fileLocalUrl: null as string | null,
               absolutePath: null as string | null,
               exists: false
             }
@@ -1589,24 +1597,41 @@ class HttpApiService {
         if ((shouldResolveMediaPath || includeField('file')) && file?.name && dbPath && myWxid) {
           try {
             const monthFolders = this.buildFileMonthCandidates(createTimeMs)
-            const fileName = String(file.name)
+            const fileName = this.decodeXmlEntities(String(file.name))
             let resolvedPath = ''
+            
+            // 构建可能的文件名（处理非法字符被微信替换的情况）
+            const fileNameCandidates = [fileName]
+            const sanitizedFileName = fileName.replace(/[<>:"/\\|?*]/g, '_')
+            if (sanitizedFileName !== fileName) {
+              fileNameCandidates.push(sanitizedFileName)
+            }
+
             for (const accountDir of accountDirCandidates) {
               for (const monthFolder of monthFolders) {
-                const candidate = join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
-                if (existsSync(candidate)) {
-                  resolvedPath = candidate
-                  break
+                for (const fName of fileNameCandidates) {
+                  const candidate = join(dbPath, accountDir, 'msg', 'file', monthFolder, fName)
+                  if (existsSync(candidate)) {
+                    resolvedPath = candidate
+                    break
+                  }
                 }
+                if (resolvedPath) break
               }
               if (resolvedPath) break
             }
             if (!resolvedPath) {
               const accountDir = accountDirCandidates[0] || myWxid
               const monthFolder = monthFolders[0] || ''
-              resolvedPath = join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
+              resolvedPath = join(dbPath, accountDir, 'msg', 'file', monthFolder, fileNameCandidates[1] || fileName)
             }
             file.absolutePath = resolvedPath
+            file.fileLocalPath = resolvedPath
+            try {
+              file.fileLocalUrl = pathToFileURL(resolvedPath).toString()
+            } catch {
+              file.fileLocalUrl = null
+            }
             file.exists = existsSync(resolvedPath)
           } catch {
             // ignore file path resolve errors
@@ -1628,6 +1653,8 @@ class HttpApiService {
             ...unifiedMessage,
             payload: {
               ...unifiedMessage.payload,
+              fileLocalPath: localPath,
+              fileLocalUrl: localFileUrl,
               localPath,
               localFileUrl,
               exists: Boolean(file?.exists)

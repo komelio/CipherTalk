@@ -2775,7 +2775,10 @@ class ChatService extends EventEmitter {
       if (type !== '6') return {}
 
       // 提取文件名 (title)
-      const fileName = this.extractXmlValue(content, 'title')
+      let fileName = this.extractXmlValue(content, 'title')
+      if (fileName) {
+        fileName = this.decodeHtmlEntities(fileName)
+      }
 
       // 提取文件大小 (totallen)
       const totallenStr = this.extractXmlValue(content, 'totallen')
@@ -2821,16 +2824,26 @@ class ChatService extends EventEmitter {
     const nextMonth = new Date(msgDate)
     nextMonth.setMonth(nextMonth.getMonth() + 1)
     pushMonth(nextMonth)
+    // 下载时间可能是当前月份
+    pushMonth(new Date())
+
+    const fileNameCandidates = [fileName]
+    const sanitizedFileName = fileName.replace(/[<>:"/\\|?*]/g, '_')
+    if (sanitizedFileName !== fileName) {
+      fileNameCandidates.push(sanitizedFileName)
+    }
 
     for (const monthFolder of monthCandidates) {
-      const candidate = path.join(dbPath, accountDir, 'msg', 'file', monthFolder, fileName)
-      if (fs.existsSync(candidate)) {
-        return { fileLocalPath: candidate, fileExists: true }
+      for (const fName of fileNameCandidates) {
+        const candidate = path.join(dbPath, accountDir, 'msg', 'file', monthFolder, fName)
+        if (fs.existsSync(candidate)) {
+          return { fileLocalPath: candidate, fileExists: true }
+        }
       }
     }
 
     const fallbackMonth = monthCandidates[0] || `${msgDate.getFullYear()}-${String(msgDate.getMonth() + 1).padStart(2, '0')}`
-    const fallbackPath = path.join(dbPath, accountDir, 'msg', 'file', fallbackMonth, fileName)
+    const fallbackPath = path.join(dbPath, accountDir, 'msg', 'file', fallbackMonth, fileNameCandidates[1] || fileName)
     return { fileLocalPath: fallbackPath, fileExists: fs.existsSync(fallbackPath) }
   }
 
