@@ -12,14 +12,18 @@ const SYSTEM_ACCOUNTS = [
 
 // 判断是否应该保留会话
 function shouldKeepSession(username: string): boolean {
-  if (username.startsWith('gh_')) return false
-  if (SYSTEM_ACCOUNTS.some(s => username.startsWith(s) || username === s)) return false
+  if (!username) return false
+  
+  if (username === '@placeholder_foldgroup') return false
+  
+  for (const prefix of SYSTEM_ACCOUNTS) {
+    if (username.startsWith(prefix) || username === prefix) return false
+  }
+  
   if (username.includes('@kefu.openim') || username.includes('@openim')) return false
   if (username.includes('service_')) return false
   
-  return username.includes('@chatroom') || 
-         username.startsWith('wxid_') || 
-         !username.includes('@')
+  return true
 }
 
 // 获取会话列表
@@ -132,9 +136,42 @@ function parseMessageContent(row: Record<string, unknown>): string {
     case 43: return '[视频]'
     case 47: return '[表情]'
     case 48: return '[位置]'
+    case 49: return parseAppMsg(content) // 添加对 49 的解析
     case 10000: return cleanSystemMessage(content)
     default: return content || `[消息类型:${localType}]`
   }
+}
+
+// 简单解析 XML，提取 title, des, url
+function parseAppMsg(content: string): string {
+  if (!content) return '[链接]'
+  
+  const extract = (xml: string, tag: string) => {
+    const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i')
+    const match = regex.exec(xml)
+    if (!match) return ''
+    return match[1].replace(/<!\\[CDATA\\[/g, '').replace(/\\]\\]>/g, '').trim()
+  }
+
+  const title = extract(content, 'title')
+  const type = extract(content, 'type')
+  
+  if (!title) return '[消息]'
+
+  if (type === '5' || type === '49') {
+    const des = extract(content, 'des')
+    const url = extract(content, 'url')
+    let result = `[链接] ${title}`
+    if (des) result += `\n摘要: ${des}`
+    if (url) result += `\n链接: ${url}`
+    return result
+  }
+  
+  if (type === '6') return `[文件] ${title}`
+  if (type === '19') return `[聊天记录] ${title}`
+  if (type === '33' || type === '36') return `[小程序] ${title}`
+  
+  return `[链接] ${title}`
 }
 
 // 清理系统消息 / XML（尽量提取可读文本，兼容拍一拍）

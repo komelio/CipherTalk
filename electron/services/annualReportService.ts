@@ -208,7 +208,7 @@ class AnnualReportService {
       const files = fs.readdirSync(dbDir)
       return files.filter(f => {
         const lower = f.toLowerCase()
-        return (lower.startsWith('msg') || lower.startsWith('message')) && lower.endsWith('.db')
+        return (lower.startsWith('msg') || lower.startsWith('message') || lower.startsWith('publicmsg')) && lower.endsWith('.db')
       }).map(f => path.join(dbDir, f))
     } catch {
       return []

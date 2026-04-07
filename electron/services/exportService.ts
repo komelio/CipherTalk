@@ -1,4 +1,4 @@
-﻿import * as fs from 'fs'
+import * as fs from 'fs'
 import * as path from 'path'
 import * as https from 'https'
 import * as http from 'http'
@@ -283,7 +283,7 @@ class ExportService {
       const files = fs.readdirSync(this.dbDir)
       for (const file of files) {
         const lower = file.toLowerCase()
-        if ((lower.startsWith('message') || lower.startsWith('msg')) && lower.endsWith('.db')) {
+        if ((lower.startsWith('message') || lower.startsWith('msg') || lower.startsWith('publicmsg')) && lower.endsWith('.db')) {
           dbs.push(path.join(this.dbDir, file))
         }
       }
@@ -301,7 +301,30 @@ class ExportService {
       const tables = db.prepare(
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
       ).all() as any[]
-      const hash = this.getTableNameHash(sessionId).toLowerCase()
+      let hash = this.getTableNameHash(sessionId).toLowerCase()
+      
+      // 尝试从 Name2Id 表获取公众号真正的 hash / rowid
+      if (sessionId.startsWith('gh_')) {
+          try {
+             const hasName2Id = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'").get()
+             if (hasName2Id) {
+                 const cols = db.prepare("PRAGMA table_info(Name2Id)").all() as any[];
+                 const colNames = cols.map(c => c.name);
+                 const nameCol = colNames.includes('usrName') ? 'usrName' : (colNames.includes('user_name') ? 'user_name' : null);
+                 if (nameCol) {
+                    const n2i = db.prepare(`SELECT * FROM Name2Id WHERE ${nameCol} = ?`).get(sessionId) as any
+                    if (n2i) {
+                        const alias = n2i.alias || n2i.Alias;
+                        if (alias && alias !== sessionId) {
+                           hash = this.getTableNameHash(alias).toLowerCase();
+                        }
+                    }
+                 }
+             }
+          } catch (e) {
+          }
+      }
+
       // 1. 精确哈希提取匹配（大小写无关）：从表名中提取 32 位 hex 片段后比对
       for (const table of tables) {
         const name = table.name as string
@@ -608,7 +631,14 @@ class ExportService {
         if (type === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]'
         if (type === '33' || type === '36') return title ? `[小程序] ${title}` : '[小程序]'
         if (type === '57') return title || '[引用消息]'
-        if (type === '5' || type === '49') return title ? `[链接] ${title}` : '[链接]'
+        if (type === '5' || type === '49') {
+          const des = this.extractXmlValue(content, 'des')
+          const url = this.extractXmlValue(content, 'url')
+          let result = title ? `[链接] ${title}` : '[链接]'
+          if (des) result += `\n摘要: ${des}`
+          if (url) result += `\n链接: ${url}`
+          return result
+        }
         return title ? `[链接] ${title}` : '[链接]'
       }
       case 50: return '[通话]'
@@ -647,7 +677,14 @@ class ExportService {
           if (xmlType === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]'
           if (xmlType === '33' || xmlType === '36') return title ? `[小程序] ${title}` : '[小程序]'
           if (xmlType === '57') return title || '[引用消息]'
-          if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]'
+          if (xmlType === '5' || xmlType === '49') {
+            const des = this.extractXmlValue(content, 'des')
+            const url = this.extractXmlValue(content, 'url')
+            let result = title ? `[链接] ${title}` : '[链接]'
+            if (des) result += `\n摘要: ${des}`
+            if (url) result += `\n链接: ${url}`
+            return result
+          }
 
           // 有 title 就返回 title
           if (title) return title

@@ -742,7 +742,7 @@ class ChatService extends EventEmitter {
       const files = fs.readdirSync(this.dbDir)
       for (const file of files) {
         const lower = file.toLowerCase()
-        if ((lower.startsWith('message') || lower.startsWith('msg')) && lower.endsWith('.db')) {
+        if ((lower.startsWith('message') || lower.startsWith('msg') || lower.startsWith('publicmsg') || lower.startsWith('biz_message')) && lower.endsWith('.db')) {
           const fullPath = path.join(this.dbDir, file)
           allDbs.push(fullPath)
 
@@ -875,7 +875,38 @@ class ChatService extends EventEmitter {
         "SELECT name FROM sqlite_master WHERE type='table' AND lower(name) LIKE 'msg_%'"
       ).all() as any[]
 
-      const hash = this.getTableNameHash(sessionId).toLowerCase()
+      let hash = this.getTableNameHash(sessionId).toLowerCase()
+      
+      // 公众号可能有不同前缀或不同 hash 算法的表名，这里增加日志帮助排查
+        if (sessionId.startsWith('gh_')) {
+          console.log(`[ChatService] 正在查找公众号消息表: session=${sessionId}, hash=${hash}, dbName=${db.name}`);
+          
+          // 尝试从 Name2Id 表获取公众号真正的 hash / rowid
+          try {
+             const hasName2Id = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='Name2Id'").get()
+             if (hasName2Id) {
+                 // 有的微信版本 Name2Id 里的字段是 usrName 还是 user_name 并不确定
+                 const cols = db.prepare("PRAGMA table_info(Name2Id)").all() as any[];
+                 const colNames = cols.map(c => c.name);
+                 const nameCol = colNames.includes('usrName') ? 'usrName' : (colNames.includes('user_name') ? 'user_name' : null);
+                 if (nameCol) {
+                    const n2i = db.prepare(`SELECT * FROM Name2Id WHERE ${nameCol} = ?`).get(sessionId) as any
+                    if (n2i) {
+                        console.log(`[ChatService] 在 ${db.name} 找到 Name2Id 映射:`, n2i);
+                        // 如果有 alias，尝试使用 alias 重新计算 hash
+                        const alias = n2i.alias || n2i.Alias;
+                        if (alias && alias !== sessionId) {
+                           const aliasHash = this.getTableNameHash(alias).toLowerCase();
+                           console.log(`[ChatService] 使用别名 ${alias} 重新计算 Hash: ${aliasHash}`);
+                           hash = aliasHash;
+                        }
+                    }
+                 }
+             }
+          } catch (e) {
+             console.log('Error checking Name2Id:', e)
+          }
+        }
 
       for (const table of tables) {
         const name = table.name as string
@@ -883,18 +914,24 @@ class ChatService extends EventEmitter {
         // 优先精确提取 hash 匹配
         const tableHash = this.extractTableHash(name)
         if (tableHash && tableHash === hash) {
+          if (sessionId.startsWith('gh_')) {
+             console.log(`[ChatService] ✅ 成功匹配到公众号消息表: ${name}`);
+          }
           return name
         }
 
         // 兜底兼容：历史表名规则可能不完全一致，采用大小写无关包含匹配
         if (name.toLowerCase().includes(hash)) {
+          if (sessionId.startsWith('gh_')) {
+             console.log(`[ChatService] ✅ 成功(兼容)匹配到公众号消息表: ${name}`);
+          }
           return name
         }
       }
 
       if (tables.length > 0) {
         const sample = tables.slice(0, 8).map(t => t.name).join(', ')
-        console.warn(`[ChatService] 未匹配到消息表: session=${sessionId}, hash=${hash}, tables=${tables.length}, sample=[${sample}]`)
+        console.warn(`[ChatService] ❌ 未匹配到消息表: session=${sessionId}, hash=${hash}, db=${db.name}, tables=${tables.length}, sample=[${sample}]`)
       }
     } catch { }
 
@@ -2502,8 +2539,14 @@ class ChatService extends EventEmitter {
     if (title) {
       switch (type) {
         case '5':
-        case '49':
-          return `[链接] ${title}`
+        case '49': {
+          const des = this.extractXmlValue(content, 'des')
+          const url = this.extractXmlValue(content, 'url')
+          let result = `[链接] ${title}`
+          if (des) result += `\n摘要: ${des}`
+          if (url) result += `\n链接: ${url}`
+          return result
+        }
         case '6':
           return `[文件] ${title}`
         case '19':
@@ -3093,6 +3136,77 @@ class ChatService extends EventEmitter {
   }
 
   /**
+   * 获取公众号列表
+   */
+  async getOfficialAccounts(): Promise<{ success: boolean; accounts?: ContactInfo[]; error?: string }> {
+    try {
+      if (!this.contactDb) {
+        const connectResult = await this.connect()
+        if (!connectResult.success) {
+          return { success: false, error: connectResult.error }
+        }
+      }
+
+      if (!this.contactDb) {
+        return { success: false, error: '联系人数据库未连接' }
+      }
+
+      // 获取表结构
+      const columns = this.contactDb.prepare("PRAGMA table_info(contact)").all() as any[]
+      const columnNames = columns.map((c: any) => c.name)
+
+      const hasBigHeadUrl = columnNames.includes('big_head_url')
+      const hasSmallHeadUrl = columnNames.includes('small_head_url')
+
+      const selectCols = ['username', 'remark', 'nick_name', 'alias']
+      if (hasBigHeadUrl) selectCols.push('big_head_url')
+      if (hasSmallHeadUrl) selectCols.push('small_head_url')
+
+      // 查询所有以 gh_ 开头的联系人，即为公众号
+      const rows = this.contactDb.prepare(`
+        SELECT ${selectCols.join(', ')} 
+        FROM contact 
+        WHERE username LIKE 'gh_%'
+      `).all() as any[]
+
+      const accounts: ContactInfo[] = []
+      
+      for (const row of rows) {
+        const username = row.username || ''
+        const displayName = row.remark || row.nick_name || row.alias || username
+        
+        let avatarUrl: string | undefined
+        if (hasBigHeadUrl && row.big_head_url) {
+          avatarUrl = row.big_head_url
+        } else if (hasSmallHeadUrl && row.small_head_url) {
+          avatarUrl = row.small_head_url
+        }
+
+        accounts.push({
+          username,
+          displayName,
+          remark: row.remark || undefined,
+          nickname: row.nick_name || undefined,
+          avatarUrl,
+          type: 'official'
+        })
+      }
+
+      // 获取可能缺少的头像
+      for (const account of accounts) {
+        if (!account.avatarUrl) {
+          account.avatarUrl = await this.getAvatarFromHeadImageDb(account.username)
+        }
+      }
+
+      return { success: true, accounts }
+    } catch (e) {
+      console.error('ChatService: 获取公众号列表失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
    * 检查是否像 base64 编码
    */
   private looksLikeBase64(s: string): boolean {
@@ -3102,7 +3216,9 @@ class ChatService extends EventEmitter {
 
   private shouldKeepSession(username: string): boolean {
     if (!username) return false
-    if (username.startsWith('gh_')) return false
+    
+    // 允许服务号/订阅号 (gh_ 开头) 和 officialaccounts 文件夹
+    // 微信在 PC 端通常不区分 officialaccounts，而是直接展示 gh_
 
     // 过滤折叠对话占位符
     if (username === '@placeholder_foldgroup') return false
