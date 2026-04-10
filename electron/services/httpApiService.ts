@@ -50,6 +50,10 @@ interface CleanedVideoMsg {
     videoUrl: string
     coverUrl: string
     duration: number
+    decodeKey?: string
+    urlToken?: string
+    aeskey?: string
+    md5?: string
   }
   rawType: number
 }
@@ -64,7 +68,17 @@ type MessagePayload =
       longitude: number | null
       poiId: string
     }
-  | { type: 'channels'; nickname: string; desc: string; videoUrl: string; cover: string }
+  | {
+      type: 'channels'
+      nickname: string
+      desc: string
+      videoUrl: string
+      cover: string
+      decodeKey?: string
+      urlToken?: string
+      aeskey?: string
+      md5?: string
+    }
   | {
       type: 'file'
       fileName: string
@@ -446,6 +460,8 @@ class HttpApiService {
     const thumbUrl = this.extractXmlTagValue(appmsg, 'thumburl')
     const templateId = this.extractXmlTagValue(appmsg, 'template_id')
     const recordItemRaw = this.extractXmlTagValue(appmsg, 'recorditem')
+    const aeskey = this.pickFirstNonEmpty(this.extractXmlTagValue(appmsg, 'aeskey'), this.extractXmlTagValue(appmsg, 'aesKey'))
+    const md5 = this.extractXmlTagValue(appmsg, 'md5')
 
     const webviewSharedBlock = this.extractXmlBlock(appmsg, 'webviewshared')
     const webviewShared = webviewSharedBlock
@@ -466,7 +482,9 @@ class HttpApiService {
           title: this.extractXmlTagValue(streamVideoBlock, 'streamvideotitle'),
           wording: this.extractXmlTagValue(streamVideoBlock, 'streamvideowording'),
           thumbUrl: this.extractXmlTagValue(streamVideoBlock, 'streamvideothumburl'),
-          totalTime: this.extractXmlTagValue(streamVideoBlock, 'streamvideototaltime')
+          totalTime: this.extractXmlTagValue(streamVideoBlock, 'streamvideototaltime'),
+          aeskey: this.pickFirstNonEmpty(this.extractXmlTagValue(streamVideoBlock, 'aeskey'), this.extractXmlTagValue(streamVideoBlock, 'aesKey')),
+          md5: this.extractXmlTagValue(streamVideoBlock, 'md5')
         }
       : null
 
@@ -477,7 +495,8 @@ class HttpApiService {
           fileExt: this.extractXmlTagValue(appAttachBlock, 'fileext'),
           totalLen: this.extractXmlTagValue(appAttachBlock, 'totallen'),
           attachId: this.extractXmlTagValue(appAttachBlock, 'attachid'),
-          cdnAttachUrl: this.extractXmlTagValue(appAttachBlock, 'cdnattachurl')
+          cdnAttachUrl: this.extractXmlTagValue(appAttachBlock, 'cdnattachurl'),
+          aeskey: this.pickFirstNonEmpty(this.extractXmlTagValue(appAttachBlock, 'aeskey'), this.extractXmlTagValue(appAttachBlock, 'aesKey'))
         }
       : null
 
@@ -514,7 +533,11 @@ class HttpApiService {
             width: this.extractXmlTagValue(block, 'width'),
             height: this.extractXmlTagValue(block, 'height'),
             videoPlayDuration: this.extractXmlTagValue(block, 'videoPlayDuration'),
-            videoDuration: this.extractXmlTagValue(block, 'videoDuration')
+            videoDuration: this.extractXmlTagValue(block, 'videoDuration'),
+            decodeKey: this.extractXmlTagValue(block, 'decodeKey'),
+            urlToken: this.extractXmlTagValue(block, 'urlToken'),
+            aeskey: this.pickFirstNonEmpty(this.extractXmlTagValue(block, 'aeskey'), this.extractXmlTagValue(block, 'aesKey')),
+            md5: this.extractXmlTagValue(block, 'md5')
           }) as Record<string, any> | undefined
         })
         .filter((item): item is Record<string, any> => Boolean(item))
@@ -608,6 +631,8 @@ class HttpApiService {
       thumbUrl,
       templateId,
       recordItemRaw,
+      aeskey,
+      md5,
       webviewShared,
       streamVideo,
       appAttach,
@@ -743,7 +768,11 @@ class HttpApiService {
         description: String(finderFeed.desc || ''),
         videoUrl: String(media.url || ''),
         coverUrl: String(media.thumbUrl || media.coverUrl || ''),
-        duration
+        duration,
+        decodeKey: media.decodeKey || undefined,
+        urlToken: media.urlToken || undefined,
+        aeskey: media.aeskey || undefined,
+        md5: media.md5 || undefined
       }
     }
   }
@@ -827,7 +856,11 @@ class HttpApiService {
         nickname: String(finderFeed.nickname || ''),
         desc: String(finderFeed.desc || ''),
         videoUrl: String(finderMedia.url || ''),
-        cover: String(finderMedia.thumbUrl || finderMedia.coverUrl || '')
+        cover: String(finderMedia.thumbUrl || finderMedia.coverUrl || ''),
+        decodeKey: finderMedia.decodeKey || undefined,
+        urlToken: finderMedia.urlToken || undefined,
+        aeskey: finderMedia.aeskey || undefined,
+        md5: finderMedia.md5 || undefined
       }
     } else if (appMsgTypeNum === 6) {
       payload = {

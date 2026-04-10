@@ -933,7 +933,7 @@ class ChatService extends EventEmitter {
 
       if (tables.length > 0) {
         const sample = tables.slice(0, 8).map(t => t.name).join(', ')
-        console.warn(`[ChatService] ❌ 未匹配到消息表: session=${sessionId}, hash=${hash}, db=${db.name}, tables=${tables.length}, sample=[${sample}]`)
+        // console.warn(`[ChatService] ❌ 未匹配到消息表: session=${sessionId}, hash=${hash}, db=${db.name}, tables=${tables.length}, sample=[${sample}]`)
       }
     } catch { }
 
