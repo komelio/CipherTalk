@@ -1,3 +1,4 @@
+// @ts-ignore
 import Database from 'better-sqlite3'
 import { EventEmitter } from 'events'
 import * as fs from 'fs'
