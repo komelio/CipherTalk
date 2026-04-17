@@ -12,7 +12,7 @@ import {
   Eye, EyeOff, Key, FolderSearch, FolderOpen, Search,
   RotateCcw, Trash2, Save, Plug, X, Check, Sun, Moon, Monitor,
   Palette, Database, ImageIcon, Download, HardDrive, Info, RefreshCw, Shield, Clock, CheckCircle, AlertCircle, Mic,
-  Zap, Layers, User, Sparkles, Github, Fingerprint, Lock, ShieldCheck, Minus, Plus, Smile, ChevronDown
+  Zap, Layers, User, Sparkles, Globe, Fingerprint, Lock, ShieldCheck, Minus, Plus, Smile, ChevronDown
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import './SettingsPage.scss'
@@ -3570,7 +3570,7 @@ function SettingsPage() {
             style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', borderRadius: '20px' }}
             onClick={() => window.electronAPI.shell.openExternal('https://github.com/ILoveBingLu/miyu')}
           >
-            <Github size={16} />
+            <Globe size={16} />
             <span>密语 CipherTalk</span>
           </button>
           <button
@@ -3578,7 +3578,7 @@ function SettingsPage() {
             style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px 16px', borderRadius: '20px' }}
             onClick={() => window.electronAPI.shell.openExternal('https://github.com/hicccc77/WeFlow')}
           >
-            <Github size={16} />
+            <Globe size={16} />
             <span>WeFlow</span>
           </button>
         </div>
